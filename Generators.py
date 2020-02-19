@@ -160,13 +160,11 @@ def fc_gen(n0,n1,n2,n3=None, tanh=False, sigmoid=False, softplus=False, nl_type=
     gen.apply(weights_init)
     return gen
 
-def lin_gen(n0,n1, nl=nn.Identity()):
+def lin_gen(n0,n1):
     
     layers = [
         nn.Flatten(),
         nn.Linear(n0, n1, bias=False)]
 
-    layers += [nl]
-    
     gen = nn.Sequential(*layers)
     return gen

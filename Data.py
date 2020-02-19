@@ -27,7 +27,7 @@ def load_data(dname, binary=False, image_size=32, ntrain=5*10**4, ntest=10**4, s
 
     elif dname == "fmnist":
         import h5py as h5
-        with h5.File("../common_data/fashion_mnist.h5" ,"r") as f:
+        with h5.File("data/fashion_mnist.h5" ,"r") as f:
             train_images = f["train_images"].value
             train_labels = f["train_labels"].value
 
@@ -60,7 +60,7 @@ def load_data(dname, binary=False, image_size=32, ntrain=5*10**4, ntest=10**4, s
 
     elif dname == "mnist":
         import h5py as h5
-        with h5.File("../common_data/mnist.h5" ,"r") as f:
+        with h5.File("data/mnist.h5" ,"r") as f:
             train_images = f["train_images"].value
             train_labels = f["train_labels"].value
 
@@ -109,7 +109,7 @@ def load_data(dname, binary=False, image_size=32, ntrain=5*10**4, ntest=10**4, s
 
         ds = []
         for i in range(1,6):
-            ds += unpickle("../common_data/cifar-10/data_batch_%d"%i)[b"data"],
+            ds += unpickle("data/cifar-10/data_batch_%d"%i)[b"data"],
         train_images = np.concatenate(ds, 0)
         
         train_images = pre_process(train_images)
@@ -118,7 +118,7 @@ def load_data(dname, binary=False, image_size=32, ntrain=5*10**4, ntest=10**4, s
             torch.utils.data.TensorDataset(torch.tensor(train_images)),
             batch_size=batch_size, shuffle=True)
 
-        test_images = unpickle("../common_data/cifar-10/test_batch")[b"data"]
+        test_images = unpickle("data/cifar-10/test_batch")[b"data"]
         test_images = pre_process(test_images)
         
         
@@ -130,7 +130,7 @@ def load_data(dname, binary=False, image_size=32, ntrain=5*10**4, ntest=10**4, s
             data = data.reshape(data.shape[0], -1)
             return data.astype("float32")
         
-        images = np.load("../common_data/celeba%d.npz"%image_size)["images"]
+        images = np.load("data/celeba%d.npz"%image_size)["images"]
         train_images = images[:ntrain]
         
         train_images = pre_process(train_images)

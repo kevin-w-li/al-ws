@@ -18,6 +18,45 @@ def l2_distance(FX,FY, stable):
         FK -= 2 * (FX[:,None,:] * FY[None,:,:]).sum(-1)
     
     return FK
+
+
+class PolynomialKernel(nn.Module):
+
+    def __init__(self, nets=[torch.nn.Identity()], sigma=1.0, c=1.0,  p=2.0, lam=0.01, train_lam=False, train_sigma=False):
+
+        super().__init__() 
+
+        Fdata = []
+        self.n = len(nets)
+        self.log_lam = nn.Parameter(torch.tensor(math.log(lam)), requires_grad=train_lam)
+        self.c = c
+        self.p = p
+        self.log_sigma = nn.Parameter(torch.tensor(math.log(sigma)), requires_grad=train_sigma)
+        self.kernel_networks = nn.ModuleList(nets)
+
+    def forward(self, x, y):
+        return self.gram(x, y)
+
+    def dgg(self, X,Y,g):
+        
+        # embedding of X
+        FX = g(X)
+        FY = g(Y)
+
+        return FX@FY.T
+
+    def gram(self, X, Y):
+        # compute the gram matrix 
+        nx, sx = X.shape
+        ny, sy = Y.shape
+        FK = 0.0
+        for k in self.kernel_networks:
+            FK = FK + self.dgg(X, Y, k)
+
+        G = (self.c + FK / self.log_sigma.exp())** self.p
+        return G
+    
+    
     
 class SetGaussianKernel(nn.Module):
 
@@ -65,15 +104,12 @@ class SetGaussianKernel(nn.Module):
             XY = XY + xy
             XX = XX + xx
             YY = YY + yy
-        
-        KXX = torch.exp(- 0.5 * XX / (self.log_sigma.exp()**2)).sum([1,2])
-        KYY = torch.exp(- 0.5 * YY / (self.log_sigma.exp()**2)).sum([1,2])
-        KXY = torch.exp(- 0.5 * XY / (self.log_sigma.exp()**2)).sum([2,3])
 
+        KXX = torch.exp(- 0.5 * XX / (self.log_sigma.exp()**2)).mean([1,2])
+        KYY = torch.exp(- 0.5 * YY / (self.log_sigma.exp()**2)).mean([1,2])
+        KXY = torch.exp(- 0.5 * XY / (self.log_sigma.exp()**2)).mean([2,3])
 
-        FK = ( 1. / (sx * sx) * KXX[:,None] \
-             + 1. / (sy * sy) * KYY[None,:] \
-             - 2. / (sx * sy) * KXY)
+        FK = ( KXX[:,None] * KYY[None,:] - 2. * KXY)
 
         G =  (-0.5*FK/(self.log_theta_out.exp()**2)).exp()
 
@@ -99,7 +135,7 @@ class RFKernel(nn.Module):
         elif self.p == 0.5:
             self.W = nn.Parameter(td.Cauchy(0,1).sample([nfeat_in, nfeat]), requires_grad=False)
         else:
-            raise(NotImplementedError, "wrong p")
+            raise NotImplementedError("wrong p")
         self.b = nn.Parameter(torch.rand(nfeat) * 2 * math.pi, requires_grad=False)
         
 
@@ -169,9 +205,9 @@ class Kernel(nn.Module):
 
         return FK
 
-    def weights(self, X,Y):
+    def kmm_weight(self, X,Y):
 
-        ''' importance weight to correct for covariate shift, Arthur Gretton 2003
+        ''' importance weight to correct for covariate shift, from Kernel Mean Matching (Gretton, 2003)
         '''
         
         X = X
@@ -233,7 +269,10 @@ class Kernel(nn.Module):
 class SetKernel(nn.Module):
 
     def __init__(self, nets=[torch.nn.Identity()], sigma=1.0,  lam=0.01, train_sigma=False, train_lam=False, stable=False, reweight=False):
-
+        """
+        implement a kernel over sets
+        at the moment, only supports a linear input kernel and Gaussian output kernel 
+        """
         super().__init__() 
 
         Fdata = []
@@ -261,10 +300,6 @@ class SetKernel(nn.Module):
             n, sy, _ = FY.shape 
             FY = FY.view(n, sy)
         ny, sy = FY.shape
-
-        #FK = (FX**2).sum(-1, keepdim=True)
-        #FK = FK + (FY**2).sum(-1, keepdim=True).t()
-        #FK -= 2 * (FX[:,None,:] * FY[None,:,:]).sum(-1)
 
         # simulated set-wise operations 
         XX = torch.bmm(FX[:,:,None], FX[:,None,:]).sum([1, 2]) / (sx ** 2)
@@ -355,11 +390,11 @@ def set_weights_init(std):
     return weights_init
      
 
-def save_kws(fn, obs, kernel=None, optimizer=None, kernel_optimizer=None):
+def save_kws(fn, model, kernel=None, optimizer=None, kernel_optimizer=None):
     dicts = {}
-    dicts["obs"] = obs.network.state_dict()
+    dicts["model"] = model.state_dict()
     if kernel is not None:
-        dicts["kernel_network"] = kernel.state_dict()
+        dicts["kernel"] = kernel.state_dict()
     if optimizer is not None:
         dicts["optimizer"] = optimizer.state_dict()
     if kernel_optimizer is not None:
@@ -368,12 +403,12 @@ def save_kws(fn, obs, kernel=None, optimizer=None, kernel_optimizer=None):
     torch.save(dicts, 
                fn)
 
-def load_kws(fn, obs, kernel_network=None, optimizer=None, kernel_optimizer=None):
+def load_kws(fn, model, kernel=None, optimizer=None, kernel_optimizer=None):
     
     d = torch.load(fn)
-    obs.network.load_state_dict(d["obs"])
-    if kernel_network is not None:
-        kernel_network.load_state_dict(d["kernel_network"])
+    model.load_state_dict(d["model"])
+    if kernel is not None:
+        kernel.load_state_dict(d["kernel"])
     if optimizer is not None:
         optimizer.load_state_dict(d["optimizer"])
 
@@ -472,13 +507,17 @@ def KRR(kernel, wake_x, sleep_x, *fs, reweight=None):
     if hasattr(kernel, "reweight") and reweight is None:
         reweight = kernel.reweight
 
-    if reweight:
-        w = kernel.weights(sleep_x, wake_x)
+    if isinstance(reweight, torch.Tensor):
+        m = torch.diag(1.0/reweight)
+
+    elif reweight:
+        w = kernel.kmm_weight(sleep_x, wake_x)
+        m = torch.diag(1.0/w)
     else:
-        w = torch.ones(nsleep, device=sleep_x.device, dtype=sleep_x.dtype) 
-        
+        m = torch.eye(nsleep, device=sleep_x.device)
+
     # regressions share the same inverse of the gram matrix K(sleep_x, sleep_x)
-    K = (kernel(sleep_x, sleep_x) + torch.diag(1.0/w) * kernel.log_lam.exp())
+    K = kernel(sleep_x, sleep_x) + m * kernel.log_lam.exp()
         
     # similarity between sleep and wake data
     G = kernel(sleep_x, wake_x)
@@ -652,4 +691,4 @@ def NKRR_2(suff, kernel, wake_x, sleep_x, norm, nat, noise=0.0, npoint = 300):
     return Elogp
 
 def to_np(*args):
-    return (a.cpu().detach().numpy() for a in args)
+    return (a.cpu().detach().numpy() if type(a) is not np.ndarray else a for a in args)

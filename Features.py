@@ -57,7 +57,7 @@ def large_dc_feat(image_size=64, ndf = 32, nc=1, nfinal = None, nl=True, bn=Fals
 
     return nn.Sequential(*layers)
 
-def dc_feat(image_size=32, ndf = 32, nc=1, nfinal = None, nl=True, bn=False):
+def dc_feat(image_size=32, ndf = 32, nc=1, nfinal = None, nl=True, bn=False, final_bn=True, final_nl=False):
     norm_layer = nn.BatchNorm2d if bn else nn.Identity
     nl_layer   = nn.ReLU if nl else nn.Identity
     layers = \
@@ -75,19 +75,24 @@ def dc_feat(image_size=32, ndf = 32, nc=1, nfinal = None, nl=True, bn=False):
 
             # state size. (ndf*2) x 8 x 8
             nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=True),
-            norm_layer(ndf * 4),
             nl_layer(inplace=True),
+            norm_layer(ndf * 4),
 
             Flatten()
         ]
 
     if nfinal is not None:
         Df = 64 * ndf
-        layers += [nn.Linear(Df, nfinal), nn.BatchNorm1d(nfinal)]
+        layers += [nn.Linear(Df, nfinal)]
+    if final_bn:
+        layers += [nn.BatchNorm1d(nfinal)]
+
+    if final_nl:
+        layers += [final_nl()]
 
     return nn.Sequential(*layers)
 
-def fc_feat(n0,n1,n2, bn=True, nl=True):
+def fc_feat(n0,n1,n2,n3=0,bn=True, final_bn=True, nl=True):
     
     norm_layer = nn.BatchNorm1d if bn else Identity
     nl_layer   = nn.Softplus if nl else Identity
@@ -95,12 +100,19 @@ def fc_feat(n0,n1,n2, bn=True, nl=True):
     layers = [
         Flatten(),
         nn.Linear(n0, n1),
+        norm_layer(n1),
         nl_layer(True),
-        #norm_layer(n1),
         nn.Linear(n1, n2),
+        norm_layer(n2),
         nl_layer(True),
-        nn.BatchNorm1d(n2),
     ]
+
+    if n3 > 0:
+        layers += [
+            nn.Linear(n2, n3),
+        ]
+    if final_bn:
+        layers += norm_layer(n3),
 
     return nn.Sequential(*layers)
 
@@ -115,3 +127,29 @@ def lin_feat(n0,n1,bn=True):
     ]
 
     return nn.Sequential(*layers)
+
+def lin_fc_feat(n0,n1,bn=True):
+    
+    norm_layer = nn.BatchNorm1d if bn else Identity
+
+    layers = [
+        Flatten(),
+        nn.Linear(n0, n1),
+        norm_layer(n1),
+    ]
+
+    return nn.Sequential(*layers)
+
+def lin_dc_feat(*args, **kwargs):
+    
+    class LinFcFeature(nn.Module):
+        def __init__(self, *args, **kwargs):
+            self.__init__()
+
+            self.network = dc_feat(*args, **kwargs)
+
+        def forward(self, x):
+            return self.network(torch.cat([x, self.network(x)], -1))
+
+    feat = LinFcFeature(*args, **kwargs)
+    return feat

@@ -1,21 +1,10 @@
-import torch, math
 import torch.nn as nn
 import torch.distributions as td
 import Generators, Likelihoods
-from KernelWakeSleep import KRR_2, Kernel, SetKernel, estimate_median_distance, RFKernel
+from KernelWakeSleep import KRR_2, Kernel, SetKernel, estimate_median_distance, RFKernel, SetGaussianKernel, weights_init
 from itertools import chain
 import torch.nn.functional as F
-
-def weights_init(m, std=0.3):     
-    
-    classname = m.__class__.__name__   
-    if classname.find('Conv') != -1: 
-        m.weight.data.normal_(0.0, std) 
-    elif classname.find('Linear') != -1:    
-        m.weight.data.normal_(0.0, std)  
-    elif classname.find('BatchNorm') != -1:  
-        m.weight.data.normal_(1.0, std)   
-        m.bias.data.fill_(0) 
+import torch, math
 
 class Models(nn.Module):
     def __init__(self):
@@ -35,7 +24,7 @@ class NeuralProcess(nn.Module):
                         torch.nn.Linear(h_dim,h_dim))]
         """
 
-        assert kernel in ["set", "rf", "normal", None]
+        assert kernel in ["set", "rf", "normal", "setgauss", None]
         kernel_network = [torch.nn.Identity()]
         
         if kernel == "set":
@@ -45,11 +34,13 @@ class NeuralProcess(nn.Module):
             self.kernel = RFKernel(num_target, kernel_network, 1.0, nfeat = 100, train_sigma=True, train_lam=True).to(device)
         elif kernel == "normal":
             self.kernel = Kernel(kernel_network, 1.0, train_sigma=True, train_lam=True).to(device)
+        elif kernel == "setgauss":
+            self.kernel = SetGaussianKernel(kernel_network, sigma=1.0, theta_out=1.0, lam=0.01, train_sigma=True, train_lam=True).to(device) 
         elif kernel is None:
             pass
 
         else:
-            raise(NameError, "kernele is invalid")
+            raise(NameError, "kernel is invalid")
             
 
         ## define NP
@@ -165,7 +156,7 @@ class GMM(Models):
         
         self.alpha = nn.Parameter(torch.ones(K), requires_grad=True)
         self.mu    = nn.Parameter(torch.randn(K, D)*0.2, requires_grad=True)
-        self.chol  = nn.Parameter(torch.stack([torch.eye(D,D)*0.5]*K), requires_grad=True)
+        self.chol  = nn.Parameter(torch.stack([torch.eye(D,D)*0.3]*K), requires_grad=True)
         self.dir   = td.Dirichlet(self.alpha)
 
         
@@ -198,8 +189,16 @@ class GMM(Models):
     def suff(self, x):
         return Likelihoods.gaussian_suff(x)
 
+
 class PinWheelGMM(nn.Module):
-    
+
+    @staticmethod
+    def weights_init(m, std=0.2):     
+        
+        classname = m.__class__.__name__   
+        if classname.find('Linear') != -1:    
+            m.weight.data.normal_(0.0, std)  
+
     def __init__(self, K, D, nh=10):
         
         super().__init__()
@@ -209,17 +208,14 @@ class PinWheelGMM(nn.Module):
         self.chol  = nn.Parameter(torch.stack([torch.eye(D,D)*0.3]*K), requires_grad=True)
         
         self.mean_network = Generators.fc_gen(D,nh,D, nl_type="relu")    
-        self.mean_network.apply(weights_init)
+        self.mean_network.apply(self.weights_init)
         self.log_std = nn.Parameter(torch.zeros(D)-1, requires_grad=True)
-
         self.obs   = Likelihoods.GaussianObservation(self.mean_network, self.log_std)
-
-        
+    
     def sample_logp0(self, n):
         
         logp0 = 0
         
-        #pz_pi= td.Categorical(self.alpha.softmax(0).clamp(1e-5,1-1e-5))
         pz_pi= td.Categorical(logits=self.alpha)
         z    = pz_pi.sample([n])
         logp0 = logp0 + pz_pi.log_prob(z)
@@ -255,12 +251,12 @@ class MNISTGMM(nn.Module):
         
         self.alpha = nn.Parameter(torch.ones(K), requires_grad=True)
         self.mu    = nn.Parameter(torch.randn(K, D)*0.5, requires_grad=True)
-        #self.chol  = nn.Parameter(torch.stack([torch.eye(D,D)*0.3]*K), requires_grad=True)
-        self.chol  = nn.Parameter(torch.ones(K, D)*0.3, requires_grad=False)
+        self.chol  = nn.Parameter(torch.stack([torch.eye(D,D)*0.3]*K), requires_grad=True)
+        #self.chol  = nn.Parameter(torch.ones(K, D)*0.3, requires_grad=False)
         
         #self.mean_network = Generators.dc_gen(nz=D, ngf=32, tanh=True)    
         self.mean_network = Generators.fc_gen(D, nh, Dx,tanh=True)    
-        self.mean_network.apply(weights_init)
+        #self.mean_network.apply(weights_init)
         self.log_std = nn.Parameter(torch.zeros(()), requires_grad=True)
 
         self.obs   = Likelihoods.GaussianObservation(self.mean_network, self.log_std)
@@ -276,12 +272,13 @@ class MNISTGMM(nn.Module):
         logp0 = logp0 + pz_pi.log_prob(z)
         
         mean = self.mu[z,:]
-        #cov  = torch.einsum("ijk,ilk->ijl", self.chol, self.chol)
-        cov = self.chol
-        #cov = cov + torch.eye(cov.shape[-1], device=cov.device)  * 1e-6
+        cov  = torch.einsum("ijk,ilk->ijl", self.chol, self.chol)
+        
+        #cov = self.chol
+        cov = cov + torch.eye(cov.shape[-1], device=cov.device)  * 1e-6
         cov = cov[z,...]
         
-        py_z = td.Normal(mean, cov)
+        py_z = td.MultivariateNormal(mean, cov)
         y    = py_z.sample([])
         logp0 += py_z.log_prob(y).sum(-1)
                 
@@ -598,3 +595,276 @@ class Ecology(nn.Module):
     
     def suff(self, x):
         return Likelihoods.gaussian_suff(x)
+
+                
+
+class LGSSM(nn.Module):
+    
+    def __init__(self, Dz, Dx, A = None, z0 = None, rand_std = 0.1, noise_std = 0.1):
+        
+        super().__init__()
+        
+        self.Dx = Dx
+        self.Dz = Dz
+        if z0 is None:
+            z0 = torch.zeros(Dz)
+        self.z0 = nn.Parameter(z0)
+        if A is None:
+            A = torch.eye(Dz) * 0.8
+        self.A = nn.Parameter(A)
+        self.log_rand_std  = nn.Parameter(math.log(rand_std) * torch.ones(self.Dz))
+        self.log_noise_std = nn.Parameter(torch.tensor(math.log(noise_std)))
+        
+    def sample_logp(self, n, T):
+        
+        logp0 = 0
+        zs    = []
+        z    = self.z0.expand(n, self.Dz)
+        for t in range(T):
+            dist = td.Normal(z @ self.A, self.log_rand_std.exp())
+            z = dist.sample()
+            zs += z,
+            logp0 = logp0 + dist.log_prob(z).sum(-1)
+        
+        zs = torch.stack(zs,1)
+
+        noise_dist = td.Normal(zs[...,:], self.log_noise_std.exp())
+        xs = noise_dist.sample()
+
+        xs = xs.reshape(n, T * self.Dx)
+        nat = Likelihoods.gaussian_nat(noise_dist)
+        norm = Likelihoods.gaussian_norm(noise_dist)
+        
+        return zs.reshape(n, T, self.D), xs, norm - logp0, nat
+
+    
+    def sample(self, *arg):
+        return self.sample_logp(*arg)[1]
+    
+    def suff(self, x):
+        return gaussian_suff(x)
+        
+class DeepImage(nn.Module):
+    
+    def __init__(self, Dz, Dx, z0 = None, rand_std = 0.1, noise_std = 0.1):
+        
+        super().__init__()
+        
+        self.Dz= Dz
+        self.Dx = Dx
+        if z0 is None:
+            z0 = torch.zeros(Dz)
+        self.z0 = nn.Parameter(z0)
+
+        self.log_rand_std  = nn.Parameter(math.log(rand_std) * torch.ones(Dz))
+        self.log_noise_std = nn.Parameter(torch.tensor(math.log(noise_std)))
+        self.net = nn.Sequential(
+                    nn.Linear(Dz, Dx),
+                    nn.Tanh(),
+                    nn.Linear(Dx,Dx),
+        )
+        
+        self.net_lat = nn.Sequential(
+                    nn.Linear(Dz, Dx),
+                    nn.Tanh(),
+                    nn.Linear(Dx,Dz),
+                    nn.Tanh(),
+        )
+        
+    def sample_logp(self, n, T):
+        
+        logp0 = 0
+        zs    = []
+        z    = self.z0.expand(n, self.Dz)
+        for t in range(T):
+            dist = td.Normal(self.net_lat(z), self.log_rand_std.exp())
+            z = dist.sample()
+            zs += z,
+            logp0 = logp0 + dist.log_prob(z).sum(-1)
+        
+        zs = torch.stack(zs,1)
+        mean = self.net(zs)
+        mean = mean.reshape(n, -1)
+        
+        noise_dist = td.Normal(mean, self.log_noise_std.exp())
+        xs = noise_dist.sample()
+
+        nat = Likelihoods.gaussian_nat(noise_dist)
+        norm = Likelihoods.gaussian_norm(noise_dist)
+        
+        return zs.reshape(n, T, self.Dz), xs, norm - logp0, nat
+
+    
+    def sample(self, *args):
+        return self.sample_logp(*args)[1]
+    
+    def suff(self, x):
+        return Likelihoods.gaussian_suff(x)
+    
+class LinearImage(nn.Module):
+    
+    def __init__(self, Dx, A = None, z0 = None, rand_std = 0.1, noise_std = 0.1):
+        
+        super().__init__()
+        
+        self.D = 2
+        self.Dx = Dx
+        if z0 is None:
+            z0 = torch.zeros(D)
+        self.z0 = nn.Parameter(z0)
+
+        angle = torch.tensor(math.pi/6.0)
+        self.A = nn.Parameter(torch.tensor([[  torch.cos(angle), -torch.sin(angle)],
+                        [torch.sin(angle),  torch.cos(angle)]]))
+        self.log_rand_std  = nn.Parameter(math.log(rand_std) * torch.ones(self.D))
+        self.log_noise_std = nn.Parameter(torch.tensor(math.log(noise_std)))
+        
+    def sample_logp(self, n, T):
+        
+        logp0 = 0
+        zs    = []
+        z    = self.z0.expand(n, self.D)
+        for t in torch.arange(T, device=z.device):
+            
+#             dist = td.Normal(z @ self.A, self.log_rand_std.exp())
+#             m    = torch.cos(t*2*np.pi/8).expand(n,1)*0.5
+            m    = self.conditional_param(z)
+            dist = td.Normal(m, self.log_rand_std.exp())
+
+            z = dist.sample()
+            zs += z,
+            logp0 = logp0 + dist.log_prob(z).sum(-1)
+        
+        zs = torch.stack(zs,1)
+
+        grid = torch.linspace(-1.5,1.5,self.Dx, device=zs.device)
+        
+        mean =  torch.exp( - 0.5 * (zs[...,:1] - grid) ** 2 / (0.3)**2)
+        mean = mean.reshape(n, -1)
+
+        noise_dist = td.Normal(mean, self.log_noise_std.exp())
+        xs = noise_dist.sample()
+
+        nat = Likelihoods.gaussian_nat(noise_dist)
+        norm = Likelihoods.gaussian_norm(noise_dist)
+        
+        return zs.reshape(n, T, self.D), xs, norm - logp0, nat
+
+    
+    def sample(self, *args):
+        return self.sample_logp(*args)[1]
+    
+    def sample_joint(self, *args):
+        return self.sample_logp(*args)[:2]
+    
+    def suff(self, x):
+        return Likelihoods.gaussian_suff(x)
+    
+    def conditional_param(self, zt): 
+    
+        slope = 1.0
+        r        = torch.sqrt(torch.sum(zt**2,-1))
+        r_ratio  = 1.0/(torch.exp(-slope*4*(r-0.3)) + 1) / r 
+
+        ztp1  = zt @ self.A
+        ztp1 *= r_ratio[...,None]
+        
+        return ztp1
+
+class ICA(nn.Module):
+
+    
+    
+    def __init__(self, D0, Dx, device="cuda:0"):
+
+        super().__init__()
+
+        self.prior = torch.distributions.Laplace(torch.zeros(D0, device=device), torch.ones(D0,device=device))
+        self.gen_network = Generators.lin_gen(D0, Dx).to(device)
+        self.gen_network.apply(weights_init)
+
+        self.log_noise = nn.Parameter(torch.tensor(0.0, device=device))
+        self.obs = Likelihoods.GaussianObservation(self.gen_network, self.log_noise)
+
+    def sample_logp(self, N):
+        
+        z = self.prior.sample([N])
+        x = self.obs.sample(z)
+        nat = self.obs.nat(z)
+        norm = self.obs.norm(z)
+        
+        return z, x, nat, norm 
+
+    def draw_mean(N):
+        z = self.prior.sample([N])
+        x = self.obs.network(z)
+        return x
+        
+
+    def sample(self, N):
+        return self.sample_logp(N)[1]
+
+    def suff(self, x):
+        return self.obs.suff(x)
+    
+class BGMF(nn.Module):
+
+    def __init__(self, D, K, low = 0.1, high = 0.2, device="cuda:0", train_b=False):
+        
+        super().__init__()
+        self.prior = td.Uniform(torch.zeros(K, device=device), torch.ones(K, device=device))
+        pW = td.Uniform(low, high)
+        W  = pW.sample([K,D]).to(device)
+        
+        self._W = nn.Parameter(torch.log(W.exp() - 1.0))
+        self.b  = nn.Parameter(torch.zeros(D), requires_grad=train_b)
+    
+    @property
+    def W(self):
+        #return self._W.exp()
+        return F.softplus(self._W)
+
+
+    def conditional_mean(self, z):
+        
+        l = self.conditional_param(z)
+        
+        return l.sigmoid()
+    
+    
+    def conditional_param(self, z):
+                
+        z  = 1e-4 + z * (1-2e-4)
+        z  = torch.log( z / (1 - z) )
+        l  = z @ self.W + self.b
+        
+        return l
+    
+    def sample_logp(self, N):
+        z = self.prior.sample([N])
+        
+        l = self.conditional_param(z)
+        px = td.Bernoulli(logits=l)
+        x  = px.sample([])
+        nat = l
+        norm = F.softplus(l).sum(-1)
+        
+        return (z,l.sigmoid()), x, norm , nat
+    
+    def logp(self, z, x):
+        
+        l  = self.conditional_param(z)
+        px = td.Bernoulli(logits=l)
+        return px.log_prob(x).sum(-1)
+        
+    def forward(self, x):
+        return self.conditional_mean(x)
+        
+    def sample(self, N):
+        return self.sample_logp(N)[1]
+
+    def sleep(self, N):
+        return self.sample_logp(N)
+
+    def suff(self, x):
+        return x
